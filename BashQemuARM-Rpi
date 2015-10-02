@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+
+check_tool()
+{
+	if [ -z "$(which "$1")" ]; then
+		echo "The required tool \"${1}\" was not found. Abort."
+		exit 1
+	fi	
+}
+
+SCRIPT_NAME="$(basename "$0")"
+
+DISK_IMAGE="$1"
+
+if [ -z "$DISK_IMAGE" ]; then
+	echo "Usage: $SCRIPT_NAME DISK_IMAGE"
+	exit 1
+fi
+
+if [ "$(id -u)" != 0 ]; then
+	sudo "$0" "$@"
+	exit "$?"
+fi
+
+check_tool "qemu-img"
+check_tool "kpartx"
+
+TEMP_DIR="$(mktemp -d ${SCRIPT_NAME}.XXXXXXXX)"
+
+qemu-img resize "$DISK_IMAGE" 486M
+
+LOOP_DEVICE_NAME="$(kpartx -avs "$DISK_IMAGE" | grep -o 'loop[0-9]' | head -n 1)"
+
+mkdir -p "$TEMP_DIR/installer"
+mkdir -p "$TEMP_DIR/disk-image/boot"
+
+mount "/dev/mapper/${LOOP_DEVICE_NAME}p1" "$TEMP_DIR/disk-image/boot"
+
+(cd "$TEMP_DIR/installer" && cpio -iv < ../"disk-image/boot/installer.cpio")
+(cd "$TEMP_DIR/installer" && sed -i '/^bootdev=/s|/dev/mmcblk0|/dev/sda|' "etc/init.d/rcS")
+(cd "$TEMP_DIR/installer" && sed -i '/^bootpartition=/s|/dev/mmcblk0p1|/dev/sda1|' "etc/init.d/rcS")
+(cd "$TEMP_DIR/installer" && sed -i '/^rootdev=/s|/dev/mmcblk0|/dev/sda|' "etc/init.d/rcS")
+(cd "$TEMP_DIR/installer" && sed -i '/^rootpartition=/s|$|/dev/sda2|' "etc/init.d/rcS")
+(cd "$TEMP_DIR/installer" && find . | cpio -H newc -ov > ../"installer-qemu.cpio")
+rm -rf "$TEMP_DIR/installer"
+
+mv "$TEMP_DIR/installer-qemu.cpio" .
+
+cat << EOF > "$TEMP_DIR/disk-image/boot/installer-config.txt"
+packages=whiptail,pppoeconf
+bootsize=+64M
+EOF
+
+cat << EOF > "$TEMP_DIR/disk-image/boot/post-install.txt"
+sed -i 's|/dev/sda2|/dev/mmcblk0p2|' "/rootfs/boot/cmdline.txt"
+sed -i 's|/dev/sda1|/dev/mmcblk0p1|' "/rootfs/etc/fstab"
+sed -i 's|/dev/sda2|/dev/mmcblk0p2|' "/rootfs/etc/fstab"
+echo "gpu_mem=16" >> "/rootfs/boot/config.txt"
+EOF
+
+sync
+
+umount "$TEMP_DIR/disk-image/boot"
+
+kpartx -d "$DISK_IMAGE" > "/dev/null"
+
+rm -rf "$TEMP_DIR"
